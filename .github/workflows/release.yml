@@ -1,0 +1,243 @@
+# ============================================================
+# Anonymus Browser — Release Workflow
+# ============================================================
+# Запускается при пуше тега v*
+# Собирает .exe, checksums, создаёт GitHub Release
+# ============================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  BUILD_CONFIGURATION: Release
+  PLATFORM: x64
+
+jobs:
+  # ============================================================
+  # Сборка Windows x64
+  # ============================================================
+  build-windows-x64:
+    name: Build Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1
+        with:
+          msbuild-architecture: x64
+
+      - name: Install Dependencies
+        run: |
+          pip install pyinstaller
+          pip install argon2-cffi cryptography
+
+      - name: Generate Version
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "version=$TAG" >> $GITHUB_OUTPUT
+          echo "Building version: $TAG"
+
+      - name: Update Version in Code
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          # Обновление версии в C++ файлах
+          $files = Get-ChildItem -Path "src" -Recurse -Include "*.h","*.cc","*.py"
+          foreach ($file in $files) {
+            $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+            if ($content -match "APP_VERSION\s*=\s*\"[^\"]+\"") {
+              $content = $content -replace 'APP_VERSION\s*=\s*"[^"]+"', "APP_VERSION = `"$version`""
+              Set-Content -Path $file.FullName -Value $content
+            }
+          }
+
+      - name: Build Installer (PyInstaller)
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "AnonymusBrowserSetup_x64" `
+            --hidden-import tkinter `
+            --hidden-import tkinter.ttk `
+            --hidden-import tkinter.filedialog `
+            --hidden-import json `
+            --hidden-import struct `
+            --noconfirm `
+            installer\installer_gui.py
+
+      - name: Create Checksums
+        shell: pwsh
+        run: |
+          $file = "dist\AnonymusBrowserSetup_x64.exe"
+          $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item $file).Length
+          $checksums = "SHA256: $hash`nSize: $size bytes`nFile: AnonymusBrowserSetup_x64.exe`n"
+          Set-Content -Path "checksums_x64.txt" -Value $checksums
+          Write-Host "Checksum: $hash"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            dist/AnonymusBrowserSetup_x64.exe
+            checksums_x64.txt
+
+  # ============================================================
+  # Сборка Windows ARM64
+  # ============================================================
+  build-windows-arm64:
+    name: Build Windows ARM64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install pyinstaller
+
+      - name: Build Installer (ARM64)
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "AnonymusBrowserSetup_ARM64" `
+            --hidden-import tkinter `
+            --hidden-import json `
+            --noconfirm `
+            installer\installer_gui.py
+
+      - name: Create Checksums
+        shell: pwsh
+        run: |
+          $file = "dist\AnonymusBrowserSetup_ARM64.exe"
+          $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
+          $checksums = "SHA256: $hash`nFile: AnonymusBrowserSetup_ARM64.exe`n"
+          Set-Content -Path "checksums_arm64.txt" -Value $checksums
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64
+          path: |
+            dist/AnonymusBrowserSetup_ARM64.exe
+            checksums_arm64.txt
+
+  # ============================================================
+  # Тесты
+  # ============================================================
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install argon2-cffi cryptography
+
+      - name: Run Crypto Tests
+        run: python python/test_crypto.py
+
+  # ============================================================
+  # Создание GitHub Release
+  # ============================================================
+  release:
+    name: Create Release
+    needs: [build-windows-x64, build-windows-arm64, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download x64 Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: artifacts/x64
+
+      - name: Download ARM64 Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-arm64
+          path: artifacts/arm64
+
+      - name: Generate Release Notes
+        id: notes
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+          # Извлечение изменений из CHANGELOG.md
+          NOTES=$(awk "/^## \[$TAG\]/,/^## \[/" CHANGELOG.md | head -n -1 | tail -n +2)
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "Anonymus Browser v${{ steps.notes.outputs.tag }}"
+          body: |
+            ## Anonymus Browser v${{ steps.notes.outputs.tag }}
+
+            ${{ steps.notes.outputs.notes }}
+
+            ---
+
+            ### Установка
+
+            **Windows x64:** Скачайте `AnonymusBrowserSetup_x64.exe`
+            **Windows ARM64:** Скачайте `AnonymusBrowserSetup_ARM64.exe`
+
+            ### Проверка целостности
+
+            ```bash
+            # Windows (PowerShell)
+            Get-FileHash AnonymusBrowserSetup_x64.exe -Algorithm SHA256
+            # Сравните с checksums_x64.txt
+            ```
+
+            ### Обновление
+
+            Браузер обновится автоматически или вручную:
+            Настройки → О браузере → Проверить обновления
+          files: |
+            artifacts/x64/AnonymusBrowserSetup_x64.exe
+            artifacts/x64/checksums_x64.txt
+            artifacts/arm64/AnonymusBrowserSetup_ARM64.exe
+            artifacts/arm64/checksums_arm64.txt
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
